@@ -37,6 +37,7 @@ def prior_statistic():
             t = route[:pos]
             t = t[-N_PRED:]
             camera_node_to_pred_routes[node].append(t)
+    
     camera_node_to_node_to_A = defaultdict(dict)
     for camera_node, pred_routes in tqdm(camera_node_to_pred_routes.items()):
         for route in pred_routes:

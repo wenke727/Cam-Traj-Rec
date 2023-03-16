@@ -3,23 +3,43 @@ implementation of the iterative framework:
 do the clustering and the feedback
 """
 import os
-import pickle
+os.environ["NUMEXPR_MAX_THREADS"] = '32'
+
 import time
+import json
+import pickle
 import random
 import numpy as np
-import json
 from tqdm import tqdm
 from math import ceil, sqrt
-from multiprocessing import Pool
-from cluster_algorithm import SigCluster, FlatSearcher
 from eval import evaluate
-from itertools import combinations
 from copy import deepcopy
+from multiprocessing import Pool
 from collections import defaultdict
+
+from cluster_algorithm import SigCluster, FlatSearcher
 from routing import MAP_routing, MAP_routing_return_route, my_k_shortest_paths
 
+from misc import subsets, tms_adj_range, trans_rids_to_points, merge_tm_adj_points, cut_distant_points
+from misc import get_merge_point_idxs, process_segs, filter_noises
+from cfg import *
+from utils import parallel
 
 random.seed(233)
+import time
+DO_RECALL_ATTEMPT = True
+DO_MERGE_ATTEMPT = False
+DO_NOISE_SINGLE_CLUSTER = False
+
+MERCLUSTER_SIM_GATE = 0.8
+MISS_SHOT_P = 0.6
+ADJ_RANGE = 180
+MERGE_ATTEMPT_ADJ_RANGE = ADJ_RANGE / 2
+TM_GAP_GATE = 720
+MERGE_CLUSTER_ADJ_RANGE = 300
+
+workers = 64
+
 
 cameras = pickle.load(open("../dataset/camera_info.pkl", "rb"))
 cameras_dict = {x["id"]: x for x in cameras}
@@ -38,89 +58,43 @@ for i, r in enumerate(records):
     if t is not None:
         vid_to_rids[t].append(i)
 
-DO_RECALL_ATTEMPT = True
-DO_MERGE_ATTEMPT = False
-DO_NOISE_SINGLE_CLUSTER = False
 
-MERCLUSTER_SIM_GATE = 0.8
-MISS_SHOT_P = 0.6
-ADJ_RANGE = 180
-MERGE_ATTEMPT_ADJ_RANGE = ADJ_RANGE / 2
-TM_GAP_GATE = 720
-MERGE_CLUSTER_ADJ_RANGE = 300
+def avg_cluster_feat(cs, cid_to_rids, chunksize=500):
+    args = [cid_to_rids[c] for c in cs]
+    with Pool(processes=workers) as pool:
+        results = pool.map(
+            ave_f_unit, args, chunksize=min(ceil(len(args) / workers), chunksize))
+    
+    car_feat = np.asarray([x[0] for x in results])
 
-workers = 25
-ORDINARY_NOISE = 1
-STRONG_NOISE = 2
-ONE_NOISE = 3
-TWO_NOISE = 4
-LONG_NOISE = 5
-BLACK_LIST_NOISE = 6
-OUT_OF_SUBSET_NOISE = 7
-SINGLE_CLUSTER = 8
+    # t = time.time()
+    # res = parallel(ave_f_unit, args, False, n_jobs=workers, chunksize=min(ceil(len(args) / workers), chunksize))
+    # print(f'avg_cluster_feat_1: {time.time() - t: .4f}')
+    # _car_feat = np.asarray([x[0] for x in res])
+    # assert np.allclose(car_feat, _car_feat), "check"
+    
+    # `plate_feat` maybe None
+    tmp = [(x[1], c) for x, c in zip(results, cs) if x[1] is not None]
+    plate_feat = np.asarray([x[0] for x in tmp])
+    plate_feat_c = [x[1] for x in tmp]
 
-
-def subsets(arr, k=0, max_return=1000):
-    cnt = 0
-    if cnt >= max_return:
-        return
-    for i in range(len(arr), max(0, k - 1), -1):
-        for j in combinations(arr, i):
-            yield j
-            cnt += 1
-            if cnt >= max_return:
-                return
-
-
-def merge_tm_adj_points(points, adj_range=ADJ_RANGE):
-    node_to_tms = defaultdict(list)
-    if isinstance(points[0][-1], list):
-        for node, tm, i in points:
-            node_to_tms[node].append((tm, i))
-    else:
-        for node, tm, i in points:
-            node_to_tms[node].append((tm, [i]))
-    merge_points = []
-    for node, tms in node_to_tms.items():
-        if len(tms) == 1:
-            merge_points.append((node, tms[0][0], tms[0][1]))
-        else:
-            tms.sort(key=lambda x: x[0])
-            min_tm = tms[0][0]
-            one_cluster = [tms[0]]
-            for tm, i in tms[1:]:
-                if tm - min_tm <= adj_range:
-                    one_cluster.append((tm, i))
-                else:
-                    a, b = list(zip(*one_cluster))
-                    merge_points.append((node, np.mean(a), sum(b, [])))
-                    one_cluster = [(tm, i)]
-                    min_tm = tm
-            a, b = list(zip(*one_cluster))
-            merge_points.append((node, np.mean(a), sum(b, [])))
-    return merge_points
-
-
-def cut_distant_points(points, tm_gap_gate=TM_GAP_GATE):
-    cut_points = []
-    one_cut = [points[0]]
-    tm_last = points[0][1]
-    for point in points[1:]:
-        tm = point[1]
-        if tm - tm_last > tm_gap_gate:
-            cut_points.append(one_cut)
-            one_cut = [point]
-        else:
-            one_cut.append(point)
-        tm_last = tm
-    cut_points.append(one_cut)
-    return cut_points
+    return car_feat, plate_feat, plate_feat_c
 
 
 def detect_many_noise(cuts):
-    noises = []
-    recall_attempts = []
+    """_summary_
+
+    Args:
+        cuts (tuple): (node, time, rid lst)
+
+    Returns:
+        (tuple): noises, recall_attempts
+    """
+    noises = [] # [(rids, code), ..., ]
+    recall_attempts = [] # ([u, ut], [v, vt], inter_camera_nodes)
     long_cuts = []
+    
+    # case: len <= 2 
     for i, one_cut in enumerate(cuts):
         if len(one_cut) == 1:
             t = sum([len(cut) for cut in cuts])
@@ -129,14 +103,17 @@ def detect_many_noise(cuts):
             elif t > 6:
                 c, ct = one_cut[0][:2]
                 flag = True
+                # check merge with previous point
                 if i > 0:
                     u, ut = cuts[i - 1][-1][:2]
                     if MAP_routing(u, c, ut, ct) > 0.1:
                         flag = False
+                # check merge with next point
                 if flag and i < len(cuts) - 1:
                     v, vt = cuts[i + 1][0][:2]
                     if MAP_routing(c, v, ct, vt) > 0.1:
                         flag = False
+                
                 if flag:
                     noises.append((one_cut[0][-1], ONE_NOISE))
         elif len(one_cut) == 2:
@@ -154,12 +131,14 @@ def detect_many_noise(cuts):
         else:
             long_cuts.append(one_cut)
 
+    # case: len > 3 
     for one_cut in long_cuts:
         len_cut = len(one_cut)
         p_dict = {}
         sub_ps_raw = []
         sub_ps = []
         sub_idxs = []
+        # enumerate the k largest subsets
         for sub_idx in subsets(list(range(len_cut)), k=ceil(len_cut / 2)):
             ps = []
             for i, j in zip(sub_idx, sub_idx[1:]):
@@ -187,25 +166,18 @@ def detect_many_noise(cuts):
                     black_list.add(i)
                     noises.append((one_cut[i][-1], BLACK_LIST_NOISE))
                 else:
-                    ps = [
-                        p
-                        for p, idx in zip(sub_ps_raw, sub_idxs)
-                        if i in idx and p >= 0.01
-                    ]
-                    if (
-                        len(ps) >= min(len_cut / 3, 2)
-                        and np.mean(ps) > 0.1
-                        and max(ps) > 0.3
-                    ):
+                    ps = [p for p, idx in zip(sub_ps_raw, sub_idxs) 
+                            if i in idx and p >= 0.01]
+                    if (len(ps) >= min(len_cut / 3, 2) and np.mean(ps) > 0.1 and max(ps) > 0.3):
                         white_list.add(i)
 
-            opt_sub_p, opt_sub_idx = max(
-                (x for x in zip(sub_ps, sub_idxs) if x[0] > 0.8 * max_sub_p),
-                key=lambda x: (len(x[1]), x[0]),
-            )
+            # formula 6: sub_idxs 子集
+            opt_cands = (x for x in zip(sub_ps, sub_idxs) if x[0] > 0.8 * max_sub_p)
+            opt_sub_p, opt_sub_idx = max(opt_cands, key = lambda x: (len(x[1]), x[0]))
 
             for i in set(range(len_cut)) - set(opt_sub_idx) - black_list - white_list:
                 noises.append((one_cut[i][-1], OUT_OF_SUBSET_NOISE))
+
             if DO_RECALL_ATTEMPT and opt_sub_p > 0.3:
                 for i, j in zip(opt_sub_idx, opt_sub_idx[1:]):
                     u, ut, _ = one_cut[i]
@@ -216,27 +188,36 @@ def detect_many_noise(cuts):
                     ]
                     if inter_camera_nodes:
                         recall_attempts.append(((u, ut), (v, vt), inter_camera_nodes))
+
     if DO_MERGE_ATTEMPT:
         noise_idxss = {tuple(x[0]) for x in noises}
         non_noise_points = [
             (node, tm)
-            for one_cut in cuts
-            for node, tm, idxs in one_cut
-            if tuple(idxs) not in noise_idxss
+                for one_cut in cuts
+                    for node, tm, idxs in one_cut
+                        if tuple(idxs) not in noise_idxss
         ]
         recall_attempts += non_noise_points
+
     return noises, recall_attempts
 
 
 def noise_detect_unit(rids):
-    points = [
-        (cameras_dict[records[i]["camera_id"]]["node_id"], records[i]["time"], i)
-        for i in rids
-    ]
+    """根据时间聚类 rids, 然后类内识别 nose 和 recal attempt
+
+    Args:
+        rids (_type_): _description_
+
+    Returns:
+        (tuple): noises, recall_attempts
+    """
+    points = trans_rids_to_points(rids, records, cameras_dict)
+
     points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
     points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
     points.sort(key=lambda x: x[1])
     cuts = cut_distant_points(points, tm_gap_gate=TM_GAP_GATE)
+
     return detect_many_noise(cuts)
 
 
@@ -282,6 +263,8 @@ def recall_unit(args):
     car1, plate1 = None, None
     accept_recalls = []
     for tmp in recall_attempts:
+        # 判断加入概率是否更高
+        # ?
         if len(tmp) == 3:
             (u, ut), (v, vt), inter_camera_nodes = tmp
             p_base = None
@@ -294,13 +277,13 @@ def recall_unit(args):
                 if car1 is None:
                     car1, plate1 = calculate_ave_f(cr_idxs)
                 candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=0.7)
+                
+                # fomula 9
                 if candidates_filter:
                     if p_base is None:
                         p_base = MAP_routing(u, v, ut, vt)
                     for tm, idxs in candidates_filter:
-                        p_new = sqrt(
-                            MAP_routing(u, node, ut, tm) * MAP_routing(node, v, tm, vt)
-                        )
+                        p_new = sqrt(MAP_routing(u, node, ut, tm) * MAP_routing(node, v, tm, vt))
                         t = p_new * (1 - MISS_SHOT_P) - p_base * MISS_SHOT_P
                         if t > 0:
                             accept_recalls.append((idxs, t))
@@ -308,10 +291,8 @@ def recall_unit(args):
             node, tm = tmp
             candidates = [
                 noise
-                for noise in node_to_noises[node]
-                if tm - MERGE_ATTEMPT_ADJ_RANGE
-                < noise[0]
-                < tm + MERGE_ATTEMPT_ADJ_RANGE
+                    for noise in node_to_noises[node]
+                        if tm - MERGE_ATTEMPT_ADJ_RANGE < noise[0] < tm + MERGE_ATTEMPT_ADJ_RANGE
             ]
             if not candidates:
                 continue
@@ -320,107 +301,126 @@ def recall_unit(args):
             candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=0.78)
             for tm, idxs in candidates_filter:
                 accept_recalls.append((idxs, 0))
+                
     return accept_recalls
 
 
 def update_f_emb(labels, do_update=True):
     global f_emb
 
+    # 0. preprocess: cid_to_rids
     cid_to_rids = defaultdict(list)
     for i, c in enumerate(labels):
         if c != -1:
             cid_to_rids[c].append(i)
 
+    # 1. detecting noise ahd recall attempt
+    cid_to_noises = {}
+    cid_to_recall_attempts = {}
+
     print("detecting noise...")
     start_time = time.time()
     chunksize = min(ceil(len(cid_to_rids) / workers), 200)
     with Pool(processes=workers) as pool:
-        results = pool.map(noise_detect_unit, cid_to_rids.values(), chunksize=chunksize)
-    cid_to_noises = {}
-    cid_to_recall_attempts = {}
-    for cid, result in zip(cid_to_rids.keys(), results):
-        noises, recall_attempts = result
+        results = pool.map(
+            noise_detect_unit, cid_to_rids.values(), chunksize=chunksize) # list((noises, recall_attempts))
+    
+    for cid, (noises, recall_attempts) in zip(cid_to_rids.keys(), results):
         if noises:
             cid_to_noises[cid] = noises
         if recall_attempts:
             cid_to_recall_attempts[cid] = recall_attempts
     print("detect noise use time:", time.time() - start_time)
 
+    # 2. recall
     cid_to_accept_recalls = defaultdict(list)
     if DO_RECALL_ATTEMPT:
         print("recalling...")
         start_time = time.time()
-        node_to_noises = defaultdict(list)
-        for idxs in (noise[0] for noises in cid_to_noises.values() for noise in noises):
+        
+        # node_to_noises
+        node_to_noises = defaultdict(list) # [(avg_tms, idx), ..., ]
+        for idxs in (noise[0] for noises in cid_to_noises.values() 
+                                for noise in noises):
             tms = [records[i]["time"] for i in idxs]
-            node = cameras_dict[records[idxs[0]]["camera_id"]]["node_id"]
+            camera_id = records[idxs[0]]["camera_id"]
+            node = cameras_dict[camera_id]["node_id"]
             node_to_noises[node].append((np.mean(tms), idxs))
+        
         args = [
             (recall_attempts, cid_to_rids[cid], node_to_noises)
-            for cid, recall_attempts in cid_to_recall_attempts.items()
+                for cid, recall_attempts in cid_to_recall_attempts.items()
         ]
         chunksize = min(ceil(len(args) / workers), 200)
         with Pool(processes=workers) as pool:
-            results = pool.map(recall_unit, args, chunksize=chunksize)
-        idxs_to_cid_reward = defaultdict(list)
+            results = pool.map(recall_unit, args, chunksize=chunksize) # list(accept_recalls)
+        
+        rids_to_cid_reward = defaultdict(list)
         for cid, accept_recalls in zip(cid_to_recall_attempts.keys(), results):
             if accept_recalls:
                 for idxs, reward in accept_recalls:
-                    idxs_to_cid_reward[tuple(idxs)].append((cid, reward))
-        for idxs, cid_reward in idxs_to_cid_reward.items():
-            cid_to_accept_recalls[max(cid_reward, key=lambda x: x[1])[0]] += idxs
+                    rids_to_cid_reward[tuple(idxs)].append((cid, reward))
+        for idxs, cid_reward in rids_to_cid_reward.items():
+            max_cid = max(cid_reward, key=lambda x: x[1])[0]
+            cid_to_accept_recalls[max_cid] += idxs
+        
         print("recall use time:", time.time() - start_time)
 
     if not do_update:
         return cid_to_noises, cid_to_accept_recalls
 
+    # 3. update:
     recalled_noises = []
     to_update = []
     for cid, idxs in cid_to_accept_recalls.items():
         recalled_noises += idxs
         rids = cid_to_rids[cid]
-        nids = [y for x in cid_to_noises.get(cid, []) for y in x[0]]
-        t = set(rids) - set(nids)
+        noise_rids = [y for x in cid_to_noises.get(cid, []) for y in x[0]]
+        t = set(rids) - set(noise_rids)
         if len(t) >= len(rids) / 2:
             tmp = [f_emb[i] for i in t]
         else:
             tmp = [f_emb[i] for i in rids]
+        # formula 10
         tmp = np.mean(np.asarray(tmp), axis=0)
         to_update.append((tmp, idxs))
 
+    # 3.1 update cluster records 
     for tmp, idxs in to_update:
         for i in idxs:
             f_emb[i] = tmp
-    strong_noise_types = {ONE_NOISE, TWO_NOISE, LONG_NOISE, BLACK_LIST_NOISE}
-    ordinary_noise_types = {OUT_OF_SUBSET_NOISE}
+    
+    # 3.2 update noises' feat
     for cid, noises in cid_to_noises.items():
-        strong_noises = [
-            x[0]
-            for x in noises
-            if x[1] in strong_noise_types and x[0] not in recalled_noises
-        ]
-        ordinary_noises = [
-            x[0]
-            for x in noises
-            if x[1] in ordinary_noise_types and x[0] not in recalled_noises
-        ]
-        strong_noises = set(sum(strong_noises, []))
-        ordinary_noises = set(sum(ordinary_noises, []))
+        strong_noises = filter_noises(noises, recalled_noises, 'strong')
+        ordinary_noises = filter_noises(noises, recalled_noises, 'ordinary')
         noises = strong_noises | ordinary_noises
-        pos = cid_to_rids[cid]
-        tmp = [f_emb[i] for i in pos if i not in noises]
-        if tmp:
-            tmp = np.mean(np.asarray(tmp), axis=0)
+        
+        rids = cid_to_rids[cid]
+        _f_emb = [f_emb[i] for i in rids if i not in noises]
+        if _f_emb:
+            _f_emb = np.mean(np.asarray(_f_emb), axis=0)
         else:
-            tmp = np.mean(np.asarray([f_emb[i] for i in pos]), axis=0)
+            _f_emb = np.mean(np.asarray([f_emb[i] for i in rids]), axis=0)
+        
+        # formula 8
         for i in strong_noises:
-            f_emb[i] += 0.3 * (f_emb[i] - tmp)
+            f_emb[i] += 0.3 * (f_emb[i] - _f_emb)
         for i in ordinary_noises:
-            f_emb[i] += 0.2 * (f_emb[i] - tmp)
+            f_emb[i] += 0.2 * (f_emb[i] - _f_emb)
+    
     return cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts
 
 
 def ave_f_unit(rids):
+    """calculate the represent features for clusters
+
+    Args:
+        rids (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """
     if len(rids) == 1:
         return f_car[i], f_plate[i]
     else:
@@ -432,23 +432,12 @@ def ave_f_unit(rids):
             ave_plate = np.mean(np.asarray(fs_plate), axis=0)
         else:
             ave_plate = None
+        
         return ave_car, ave_plate
 
 
-def tms_adj_range(tms, adj_range=MERGE_CLUSTER_ADJ_RANGE):
-    tm = tms[0]
-    adj_ranges = [[max(tm - adj_range, 0), tm + adj_range]]
-    for tm in tms[1:]:
-        tm_m = tm - adj_range
-        tm_p = tm + adj_range
-        if tm_m <= adj_ranges[-1][1]:
-            adj_ranges[-1][1] = tm_p
-        else:
-            adj_ranges.append([tm_m, tm_p])
-    return adj_ranges
-
-
 def merge_cluster_unit(args):
+    # 1. prepare variables
     (c, ncs), cid_to_rids = args
     idxs1 = cid_to_rids[c]
     car1 = [f_car[i] for i in idxs1]
@@ -461,6 +450,8 @@ def merge_cluster_unit(args):
         plate1 /= np.linalg.norm(plate1) + 1e-12
     else:
         plate1 = None
+
+    # 2. filter by `multi-model similarity`, for each record in each cluster
     nidxs_filter = []
     for nc in ncs:
         idxs2 = cid_to_rids[nc]
@@ -470,6 +461,7 @@ def merge_cluster_unit(args):
             car2 /= np.linalg.norm(car2) + 1e-12
             if plate2 is not None:
                 plate2 /= np.linalg.norm(plate2) + 1e-12
+            
             sim_car = car1 @ car2
             if plate1 is not None and plate2 is not None:
                 sim_plate = plate1 @ plate2
@@ -481,18 +473,12 @@ def merge_cluster_unit(args):
     if not nidxs_filter:
         return []
 
-    points = [
-        (cameras_dict[records[i]["camera_id"]]["node_id"], records[i]["time"], i)
-        for i in cid_to_rids[c]
-    ]
-    tm_ranges = tms_adj_range(
-        sorted([x[1] for x in points]), adj_range=MERGE_CLUSTER_ADJ_RANGE
-    )
-    points_nc = [
-        (cameras_dict[records[i]["camera_id"]]["node_id"], records[i]["time"], i)
-        for i in nidxs_filter
-    ]
+    # 3. filter by time intervals
     points_nc_filter = []
+    points      = trans_rids_to_points(cid_to_rids[c], records, cameras_dict) # (node_id, time, rid)
+    points_nc   = trans_rids_to_points(nidxs_filter, records, cameras_dict)
+    tm_ranges   = tms_adj_range(sorted([x[1] for x in points]), 
+                                adj_range=MERGE_CLUSTER_ADJ_RANGE)
     for p in points_nc:
         t = p[1]
         flag = False
@@ -504,95 +490,34 @@ def merge_cluster_unit(args):
             points_nc_filter.append(p)
     if not points_nc_filter:
         return []
-    points_nc = points_nc_filter
 
+    # 4. merge and split points into `segs`
+    points_nc = points_nc_filter
     points_all = points + points_nc
     points_all = merge_tm_adj_points(points_all, adj_range=ADJ_RANGE)
     points_all = merge_tm_adj_points(points_all, adj_range=ADJ_RANGE)
-    points_all.sort(key=lambda x: x[1])
+    points_all.sort(key=lambda x: x[1]) # (node id, time, rid list)
     cuts = cut_distant_points(points_all, tm_gap_gate=TM_GAP_GATE)
 
-    noises = []
-    long_cuts = []
-    for i, one_cut in enumerate(cuts):
-        if len(one_cut) == 1:
-            noises.append(one_cut[0][-1])
-        elif len(one_cut) == 2:
-            (u, ut, _), (v, vt, _) = one_cut
-            p = MAP_routing(u, v, ut, vt)
-            if p < 0.3:
-                noises += [x[-1] for x in one_cut]
-        else:
-            long_cuts.append(one_cut)
-    for one_cut in long_cuts:
-        len_cut = len(one_cut)
-        p_dict = {}
-        sub_ps_raw = []
-        sub_ps = []
-        sub_idxs = []
-        for sub_idx in subsets(list(range(len_cut)), k=ceil(len_cut * 3 / 5)):
-            ps = []
-            for i, j in zip(sub_idx, sub_idx[1:]):
-                p = p_dict.get((i, j), None)
-                if p is None:
-                    u, ut = one_cut[i][:2]
-                    v, vt = one_cut[j][:2]
-                    p = MAP_routing(u, v, ut, vt)
-                    p_dict[(i, j)] = p
-                ps.append(p)
-            p = np.exp(np.mean(np.log(ps)))
-            sub_ps_raw.append(p)
-            sub_ps.append(np.exp(np.sum(np.log(ps)) / (len(ps) + 2)))
-            sub_idxs.append(sub_idx)
+    # 5. process cuts
+    noises = process_segs(cuts)
 
-        max_sub_p = max(sub_ps)
-        if max_sub_p < 0.3:
-            noises += [x[-1] for x in one_cut]
-        else:
-            black_list = set()
-            white_list = set()
-            for i in range(len_cut):
-                p = max(p for p, idx in zip(sub_ps_raw, sub_idxs) if i in idx)
-                if p < 0.01:
-                    black_list.add(i)
-                    noises.append(one_cut[i][-1])
-                else:
-                    ps = [
-                        p
-                        for p, idx in zip(sub_ps_raw, sub_idxs)
-                        if i in idx and p >= 0.01
-                    ]
-                    if (
-                        len(ps) >= min(len_cut / 3, 3)
-                        and np.mean(ps) > 0.2
-                        and max(ps) > 0.5
-                    ):
-                        white_list.add(i)
-            opt_sub_p, opt_sub_idx = max(
-                (x for x in zip(sub_ps, sub_idxs) if x[0] > 0.8 * max_sub_p),
-                key=lambda x: (len(x[1]), x[0]),
-            )
-            for i in set(range(len_cut)) - set(opt_sub_idx) - black_list - white_list:
-                noises.append(one_cut[i][-1])
-    noise_idxs = {idx for idxs in noises for idx in idxs}
-    orig_idxs = {x[-1] for x in points}
-    merge_point_idxs = set()
-    for p in points_all:
-        idxs = {x for x in p[-1]}
-        tmp = idxs - orig_idxs
-        if len(tmp) < len(idxs):
-            for idx in tmp:
-                merge_point_idxs.add(idx)
-    accept_idxs = {x[-1] for x in points_nc} - noise_idxs - merge_point_idxs
+    # 6. get accepted idxs
+    cand_noise_idxs = {x[-1] for x in points_nc}
+    noise_idxs  = {idx for idxs in noises for idx in idxs}
+    merge_point_idxs = get_merge_point_idxs(points, points_all)
+    accept_idxs = cand_noise_idxs - noise_idxs - merge_point_idxs
+    
     return list(accept_idxs)
 
 
-def merge_clusters(labels, ngpu=1):
+def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
     global f_emb
     print("cluster merging...")
     start_time = time.time()
 
     cid_to_rids = defaultdict(list)
+    # i: rid; c: cid
     for i, c in enumerate(labels):
         if c != -1:
             cid_to_rids[c].append(i)
@@ -626,71 +551,60 @@ def merge_clusters(labels, ngpu=1):
                 elif t <= 30:
                     cs_small.append(c)
 
-        args = [cid_to_rids[c] for c in cs_big]
-        with Pool(processes=workers) as pool:
-            results = pool.map(
-                ave_f_unit, args, chunksize=min(ceil(len(args) / workers), 100)
-            )
-        car_query = np.asarray([x[0] for x in results])
-        tmp = [(x[1], c) for x, c in zip(results, cs_big) if x[1] is not None]
-        plate_query = np.asarray([x[0] for x in tmp])
-        plate_query_c = [x[1] for x in tmp]
+        car_query, plate_query, plate_query_c  = \
+            avg_cluster_feat(cs_big, cid_to_rids, 100)
+        car_gallery, plate_gallery, plate_gallery_c = \
+            avg_cluster_feat(cs_small, cid_to_rids, 500)
 
-        args = [cid_to_rids[c] for c in cs_small]
-        with Pool(processes=workers) as pool:
-            results = pool.map(
-                ave_f_unit, args, chunksize=min(ceil(len(args) / workers), 500)
-            )
-        car_gallery = np.asarray([x[0] for x in results])
-        tmp = [(x[1], c) for x, c in zip(results, cs_small) if x[1] is not None]
-        plate_gallery = np.asarray([x[0] for x in tmp])
-        plate_gallery_c = [x[1] for x in tmp]
-
-        car_topk = 15
-        plate_topk = 30
+        # search
         car_searcher = FlatSearcher(feat_len=64, ngpu=ngpu)
         plate_searcher = FlatSearcher(feat_len=64, ngpu=ngpu)
         car_topk_idxs = car_searcher.search_by_topk(
-            query=car_query, gallery=car_gallery, topk=car_topk
-        )[1].tolist()
+            query=car_query, gallery=car_gallery, topk=car_topk)[1].tolist()
         plate_topk_idxs = plate_searcher.search_by_topk(
-            query=plate_query, gallery=plate_gallery, topk=plate_topk
-        )[1].tolist()
+            query=plate_query, gallery=plate_gallery, topk=plate_topk)[1].tolist()
+        
+        # `cluster id` to noise `cluster ids`
         c_to_nc = defaultdict(set)
-        for c, idxs in zip(cs_big, car_topk_idxs):
-            for i in idxs:
+        for c, rids in zip(cs_big, car_topk_idxs):
+            for i in rids:
                 c_to_nc[c].add(cs_small[i])
-        for c, idxs in zip(plate_query_c, plate_topk_idxs):
-            for i in idxs:
+        for c, rids in zip(plate_query_c, plate_topk_idxs):
+            for i in rids:
                 c_to_nc[c].add(plate_gallery_c[i])
 
+        # merge_cluster
         args = [((c, ncs), cid_to_rids) for c, ncs in c_to_nc.items()]
         with Pool(processes=workers) as pool:
             results = pool.map(
-                merge_cluster_unit, args, chunksize=min(ceil(len(args) / workers), 200)
-            )
-        accept_idx_to_cs = defaultdict(list)
-        for c, accept_idxs in zip(c_to_nc.keys(), results):
-            for idx in accept_idxs:
-                accept_idx_to_cs[idx].append(c)
-        c_to_accept_idxs = defaultdict(list)
-        for idx, cs in accept_idx_to_cs.items():
-            if len(cs) == 1:
-                c_to_accept_idxs[cs[0]].append(idx)
-            else:
-                c_to_accept_idxs[random.sample(cs, 1)[0]].append(idx)
+                merge_cluster_unit, args, chunksize=min(ceil(len(args) / workers), 200))
 
-        for c, idxs in c_to_accept_idxs.items():
-            for idx in idxs:
-                labels[idx] = c
-        for c, idxs in c_to_accept_idxs.items():
+        # cid_2_accept_rids: `cluster id` -> `accept idxs`  
+        accept_rid_2_cids = defaultdict(list)
+        cid_2_accept_rids = defaultdict(list)
+        for c, accept_idxs in zip(c_to_nc.keys(), results):
+            for rid in accept_idxs:
+                accept_rid_2_cids[rid].append(c)
+        for rid, cs in accept_rid_2_cids.items():
+            if len(cs) == 1:
+                cid_2_accept_rids[cs[0]].append(rid)
+            else:
+                cid_2_accept_rids[random.sample(cs, 1)[0]].append(rid)
+
+        # update `label` and `featrues`
+        for c, rids in cid_2_accept_rids.items():
+            for rid in rids:
+                labels[rid] = c
+        for c, rids in cid_2_accept_rids.items():
             tmp = [f_emb[i] for i in cid_to_rids[c]]
             tmp = np.mean(np.asarray(tmp), axis=0)
-            tmp2 = [f_emb[i] for i in idxs]
+            
+            tmp2 = [f_emb[i] for i in rids]
             tmp2 = np.mean(np.asarray(tmp2), axis=0)
+            
             delta = tmp - tmp2
-            for idx in idxs:
-                f_emb[idx] += delta
+            for rid in rids:
+                f_emb[rid] += delta
 
     print("merging consume time:", time.time() - start_time)
     return labels
@@ -700,8 +614,9 @@ if __name__ == "__main__":
     N_iter = 10
     s = 0.8
     topK = 128
-    ngpu = 3
+    ngpu = 1
     metrics = []
+    load_data = False
 
     cache_path = "data/shortest_path_results_test.pkl"
     if not os.path.exists(cache_path):
@@ -721,10 +636,9 @@ if __name__ == "__main__":
         pickle.dump(shortest_path_results, open(cache_path, "wb"))
 
     for i, operation in zip(range(N_iter), ["merge", "denoise"] * (N_iter // 2)):
+        print(f"---------- iter {i}: {operation} -----------")
 
-        print(f"---------- iter {i} -----------")
-
-        if i > -1:
+        if i > -1 and not load_data:
             print("clustering...")
             start_time = time.time()
             cluster = SigCluster(feature_dims=[64, 64, 64], ngpu=ngpu)
@@ -745,8 +659,7 @@ if __name__ == "__main__":
         if operation == "merge":
             merge_clusters(labels, ngpu=ngpu)
         elif operation == "denoise":
-            cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts = update_f_emb(
-                labels, do_update=True
-            )
+            res = update_f_emb(labels, do_update=True)
+            cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts = res
 
     json.dump(metrics, open(f"metric/metrics.json", "w"))

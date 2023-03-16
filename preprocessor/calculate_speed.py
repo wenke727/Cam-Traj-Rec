@@ -351,6 +351,7 @@ def speed_synthesize(speed_by_road, roadid_to_info):
                     s2 = level_to_speed[level]
                 else:
                     s2 = np.mean([level_to_speed[x] for x in level])
+                
                 if 0.7 * s2 < s1 < 1.3 * s2:
                     result[id] = s1
                 elif 0.5 * s2 < s1 < 1.5 * s2:
@@ -435,7 +436,7 @@ def speed_complement(G, speed_est_result, roadid_to_info):
 
 if __name__ == "__main__":
     G = pickle.load(open(road_path, "rb"))
-    roadid_to_info = {}
+    roadid_to_info = {} # {0: {'id': 0, 'length': 1706.2179999999996, 'highway': 'motorway'} ,..., }
     for u, v, k in G.edges:
         edge_info = G.edges[u, v, k]
         roadid_to_info[edge_info["id"]] = edge_info
@@ -451,6 +452,7 @@ if __name__ == "__main__":
         start_tm = int(traj[0][1][0][1] / 3600)
         assert 0 <= start_tm < 24
         trajs_for_each_slice[start_tm].append(traj)
+    
     for start_tm in range(24):
         traj_match = trajs_for_each_slice[start_tm]
         print(f"------------   start_hour:{start_tm}   ------------")
@@ -461,6 +463,7 @@ if __name__ == "__main__":
         speed_est_for_each_slice.append(deepcopy(speed_est))
         speed_est = speed_complement(G, speed_est, roadid_to_info)
         speed_est_simple_for_each_slice.append(deepcopy(speed_est))
+    
     print([len(x) for x in speed_est_for_each_slice])
     print([len(x) for x in speed_est_simple_for_each_slice])
     pickle.dump(speed_est_for_each_slice, open("data/road_speed_slice.pkl", "wb"))

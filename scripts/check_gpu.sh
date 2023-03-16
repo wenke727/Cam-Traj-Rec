@@ -1,0 +1,1 @@
+python -m nvitop --only 5 6 7

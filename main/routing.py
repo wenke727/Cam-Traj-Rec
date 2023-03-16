@@ -10,6 +10,7 @@ import numpy as np
 from math import exp
 from networkx import shortest_simple_paths
 from collections import defaultdict
+from tqdm import tqdm
 
 
 G = pickle.load(open("../dataset/road_graph.pkl", "rb"))
@@ -53,6 +54,7 @@ def my_k_shortest_paths(u, v, k):
         yield path
 
 
+# 计算摄像头两两之间的 top 10 最短路径
 path = "data/shortest_path_results.pkl"
 if os.path.exists(path):
     shortest_path_results = pickle.load(open("data/shortest_path_results.pkl", "rb"))
@@ -61,7 +63,7 @@ else:
     cameras = pickle.load(open("../dataset/camera_info.pkl", "rb"))
     camera_nodes = set(x['node_id'] for x in cameras)
     shortest_path_results = {}
-    for u in camera_nodes:
+    for u in tqdm(camera_nodes):
         for v in camera_nodes:
             if u != v:
                 try:
@@ -77,6 +79,19 @@ def gauss(v, mu):
 
 
 def route_likelihood(route, ttm, slot, route_type="node"):
+    """cal route likelihood in a special `time slot`, considering the travel time. 
+
+    Args:
+        route (list): Route in nodes seq or edges seq.
+        ttm (float): Travel time
+        slot (int): Time slot, 0~23
+        route_type (str, optional): _description_. Defaults to "node".
+
+    Returns:
+        flaot: likelihood
+        list: edges list
+    """
+    # Formula 5
     speed_dict = speed_dicts[slot]
     total_etm = 0
     if route_type == "node":
@@ -102,10 +117,23 @@ def route_likelihood(route, ttm, slot, route_type="node"):
 
 
 def route_prior(route, return_p_nostart=False):
+    """cal route prior
+
+    Args:
+        route (list): Route list
+        return_p_nostart (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        _type_: _description_
+    """
+    # Formula 4
     u = edge_info_dict[route[0]][0]
     v = edge_info_dict[route[-1]][1]
+
     A_dict = camera_node_to_node_to_A.get(v, node_to_A)
     A_dict_p = camera_node_to_node_to_A_p.get(v, node_to_A_p)
+    
+    # p_start
     if u in A_dict:
         tmp = np.sum(A_dict[u], axis=0)
         tmp += np.ones(tmp.shape) * PRIOR_W * A_dict[u].shape[0]
@@ -113,6 +141,8 @@ def route_prior(route, return_p_nostart=False):
         p_start = tmp[edge_to_pred_succ_index[route[0]]["succ"]]
     else:
         p_start = 1 / len(G.nodes[u]["succ"])
+    
+    # p_nostart
     p_nostart = 1.0
     nodes = [edge_info_dict[x][0] for x in route[1:]]
     for rin, rout, node in zip(route, route[1:], nodes):
@@ -120,9 +150,10 @@ def route_prior(route, return_p_nostart=False):
         if A is None:
             p_nostart *= 1 / len(G.nodes[node]["succ"])
         else:
-            p_nostart *= A[edge_to_pred_succ_index[rin]["pred"]][
-                edge_to_pred_succ_index[rout]["succ"]
-            ]
+            prv = edge_to_pred_succ_index[rin]["pred"]
+            nxt = edge_to_pred_succ_index[rout]["succ"]
+            p_nostart *= A[prv][nxt]
+    
     if return_p_nostart:
         return p_start * p_nostart, p_nostart
     else:
@@ -135,6 +166,7 @@ def read_k_shortest_path(u, v, k):
 
 
 def MAP_routing(u, v, ut, vt, k=K):
+    # formula 3
     ttm = vt - ut
     if ttm == 0:
         ttm += 0.01
@@ -144,6 +176,7 @@ def MAP_routing(u, v, ut, vt, k=K):
         proposals = read_k_shortest_path(u, v, k)
     else:
         proposals = []
+        # FIXME
         for inter in G[u].keys():
             tmp = my_k_shortest_paths(inter, v, 5)
             for t in tmp:
