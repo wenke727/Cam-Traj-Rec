@@ -21,7 +21,7 @@ from cluster_algorithm import SigCluster, FlatSearcher
 from routing import MAP_routing, MAP_routing_return_route, my_k_shortest_paths
 
 from misc import subsets, tms_adj_range, trans_rids_to_points, merge_tm_adj_points, cut_distant_points
-from misc import get_merge_point_idxs, process_segs, filter_noises
+from misc import get_merge_point_idxs, process_segs, filter_noises, merge_and_split_points, greedy_search_trajs
 from cfg import *
 from utils import parallel
 
@@ -32,6 +32,7 @@ DO_MERGE_ATTEMPT = False
 DO_NOISE_SINGLE_CLUSTER = False
 
 MERCLUSTER_SIM_GATE = 0.8
+DENOISE_SIM_GATE = 0.7
 MISS_SHOT_P = 0.6
 ADJ_RANGE = 180
 MERGE_ATTEMPT_ADJ_RANGE = ADJ_RANGE / 2
@@ -58,7 +59,100 @@ for i, r in enumerate(records):
     if t is not None:
         vid_to_rids[t].append(i)
 
+""" aux funs """
+def calculate_ave_f(rids): # , f_car=f_car, f_plate=f_plate
+    """calculate the average feather of `rids`, considering the normalization.
 
+    Args:
+        rids (list): the rid list.
+
+    Returns:
+        tuple: car_feat, plate_feat
+    """
+    car1 = [f_car[i] for i in rids]
+    plate1 = [f_plate[i] for i in rids]
+    car1 = np.mean(np.asarray(car1), axis=0)
+    car1 /= np.linalg.norm(car1) + 1e-12
+    plate1 = [x for x in plate1 if x is not None]
+    if plate1:
+        plate1 = np.mean(np.asarray(plate1), axis=0)
+        plate1 /= np.linalg.norm(plate1) + 1e-12
+    else:
+        plate1 = None
+    
+    return car1, plate1    
+
+def ave_f_unit(rids):
+    """calculate the average feather of `rids`
+
+    Args:
+        rids (list): the rid list.
+
+    Returns:
+        tuple: car_feat, plate_feat
+    """
+    if len(rids) == 1:
+        # BUG
+        # i = rids[0]
+        return f_car[i], f_plate[i]
+    else:
+        fs_car = [f_car[i] for i in rids]
+        fs_plate = [f_plate[i] for i in rids]
+        ave_car = np.mean(np.asarray(fs_car), axis=0)
+        # FIXME 归一化？
+        fs_plate = [x for x in fs_plate if x is not None]
+        if fs_plate:
+            ave_plate = np.mean(np.asarray(fs_plate), axis=0)
+        else:
+            ave_plate = None
+        
+        return ave_car, ave_plate
+
+def get_feat_by_rid(rid):
+    car2 = f_car[rid]
+    plate2 = f_plate[rid]
+    car2 /= np.linalg.norm(car2) + 1e-12
+    if plate2 is not None:
+        plate2 /= np.linalg.norm(plate2) + 1e-12
+
+    return car2, plate2
+
+def cal_multi_similarity(car1, plate1, car2, plate2):
+    sim_car = car1 @ car2
+    if plate1 is not None and plate2 is not None:
+        sim_plate = plate1 @ plate2
+        sim = 0.2 * sim_car + 0.8 * sim_plate
+    else:
+        sim = sim_car
+    
+    return sim
+
+def sim_filter(car, plate, candidates, sim_gate=0.7):
+    candidates_filter = []
+    for noise in candidates:
+        idxs2 = noise[1]
+        car2, plate2 = calculate_ave_f(idxs2)
+        sim = cal_multi_similarity(car, plate, car2, plate2)
+
+        if sim > sim_gate:
+            candidates_filter.append(noise)
+            
+    return candidates_filter
+
+def get_node_to_noises(cid_to_noises):
+    node_to_noises = defaultdict(list) # [(avg_tms, idx), ..., ]
+    noises = (noise[0] for noises in cid_to_noises.values() 
+                            for noise in noises)
+    for idxs in noises:
+        tms = [records[i]["time"] for i in idxs]
+        camera_id = records[idxs[0]]["camera_id"]
+        node = cameras_dict[camera_id]["node_id"]
+        node_to_noises[node].append((np.mean(tms), idxs))
+    
+    return node_to_noises
+
+
+""" ori funs """
 def avg_cluster_feat(cs, cid_to_rids, chunksize=500):
     args = [cid_to_rids[c] for c in cs]
     with Pool(processes=workers) as pool:
@@ -67,6 +161,7 @@ def avg_cluster_feat(cs, cid_to_rids, chunksize=500):
     
     car_feat = np.asarray([x[0] for x in results])
 
+    # TODO 模块化
     # t = time.time()
     # res = parallel(ave_f_unit, args, False, n_jobs=workers, chunksize=min(ceil(len(args) / workers), chunksize))
     # print(f'avg_cluster_feat_1: {time.time() - t: .4f}')
@@ -97,10 +192,10 @@ def detect_many_noise(cuts):
     # case: len <= 2 
     for i, one_cut in enumerate(cuts):
         if len(one_cut) == 1:
-            t = sum([len(cut) for cut in cuts])
-            if t == 1 and DO_NOISE_SINGLE_CLUSTER:
+            total_point_num = sum([len(cut) for cut in cuts])
+            if total_point_num == 1 and DO_NOISE_SINGLE_CLUSTER:
                 noises.append((one_cut[0][-1], SINGLE_CLUSTER))
-            elif t > 6:
+            elif total_point_num > 6:
                 c, ct = one_cut[0][:2]
                 flag = True
                 # check merge with previous point
@@ -116,6 +211,7 @@ def detect_many_noise(cuts):
                 
                 if flag:
                     noises.append((one_cut[0][-1], ONE_NOISE))
+                    
         elif len(one_cut) == 2:
             (u, ut, _), (v, vt, _) = one_cut
             p = MAP_routing(u, v, ut, vt)
@@ -133,49 +229,32 @@ def detect_many_noise(cuts):
 
     # case: len > 3 
     for one_cut in long_cuts:
-        len_cut = len(one_cut)
-        p_dict = {}
-        sub_ps_raw = []
-        sub_ps = []
-        sub_idxs = []
-        # enumerate the k largest subsets
-        for sub_idx in subsets(list(range(len_cut)), k=ceil(len_cut / 2)):
-            ps = []
-            for i, j in zip(sub_idx, sub_idx[1:]):
-                p = p_dict.get((i, j), None)
-                if p is None:
-                    u, ut = one_cut[i][:2]
-                    v, vt = one_cut[j][:2]
-                    p = MAP_routing(u, v, ut, vt)
-                    p_dict[(i, j)] = p
-                ps.append(p)
-            p = np.exp(np.mean(np.log(ps)))
-            sub_ps_raw.append(p)
-            sub_ps.append(np.exp(np.sum(np.log(ps)) / (len(ps) + 2)))
-            sub_idxs.append(sub_idx)
-
+        _len, sub_ps_raw, sub_ps, sub_idxs = greedy_search_trajs(one_cut, .5)
+        
         max_sub_p = max(sub_ps)
         if max_sub_p < 0.05:
             noises += [(x[-1], LONG_NOISE) for x in one_cut]
         elif max_sub_p > 0.45:
             black_list = set()
             white_list = set()
-            for i in range(len_cut):
-                p = max(p for p, idx in zip(sub_ps_raw, sub_idxs) if i in idx)
-                if p < 0.01:
+            
+            # iter nodes
+            for i in range(_len):
+                filterd_traj_ps = [p for p, idx in zip(sub_ps_raw, sub_idxs) if i in idx]
+                max_prob = max(filterd_traj_ps)
+                if max_prob < 0.01:
                     black_list.add(i)
                     noises.append((one_cut[i][-1], BLACK_LIST_NOISE))
                 else:
-                    ps = [p for p, idx in zip(sub_ps_raw, sub_idxs) 
-                            if i in idx and p >= 0.01]
-                    if (len(ps) >= min(len_cut / 3, 2) and np.mean(ps) > 0.1 and max(ps) > 0.3):
+                    ps = list(filter(lambda p: p >= 0.01, filterd_traj_ps))
+                    if (len(ps) >= min(_len / 3, 2) and np.mean(ps) > 0.1 and max(ps) > 0.3):
                         white_list.add(i)
 
             # formula 6: sub_idxs 子集
             opt_cands = (x for x in zip(sub_ps, sub_idxs) if x[0] > 0.8 * max_sub_p)
             opt_sub_p, opt_sub_idx = max(opt_cands, key = lambda x: (len(x[1]), x[0]))
 
-            for i in set(range(len_cut)) - set(opt_sub_idx) - black_list - white_list:
+            for i in set(range(_len)) - set(opt_sub_idx) - black_list - white_list:
                 noises.append((one_cut[i][-1], OUT_OF_SUBSET_NOISE))
 
             if DO_RECALL_ATTEMPT and opt_sub_p > 0.3:
@@ -212,59 +291,18 @@ def noise_detect_unit(rids):
         (tuple): noises, recall_attempts
     """
     points = trans_rids_to_points(rids, records, cameras_dict)
-
-    points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
-    points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
-    points.sort(key=lambda x: x[1])
-    cuts = cut_distant_points(points, tm_gap_gate=TM_GAP_GATE)
+    points, cuts = merge_and_split_points(points)
 
     return detect_many_noise(cuts)
 
 
 def recall_unit(args):
-    def calculate_ave_f(idxs):
-        car1 = [f_car[i] for i in idxs]
-        plate1 = [f_plate[i] for i in idxs]
-        car1 = np.mean(np.asarray(car1), axis=0)
-        car1 /= np.linalg.norm(car1) + 1e-12
-        plate1 = [x for x in plate1 if x is not None]
-        if plate1:
-            plate1 = np.mean(np.asarray(plate1), axis=0)
-            plate1 /= np.linalg.norm(plate1) + 1e-12
-        else:
-            plate1 = None
-        return car1, plate1
-
-    def sim_filter(car1, plate1, candidates, sim_gate=0.7):
-        candidates_filter = []
-        for noise in candidates:
-            idxs2 = noise[1]
-            car2 = [f_car[i] for i in idxs2]
-            plate2 = [f_plate[i] for i in idxs2]
-            car2 = np.mean(np.asarray(car2), axis=0)
-            car2 /= np.linalg.norm(car2) + 1e-12
-            plate2 = [x for x in plate2 if x is not None]
-            if plate2:
-                plate2 = np.mean(np.asarray(plate2), axis=0)
-                plate2 /= np.linalg.norm(plate2) + 1e-12
-            else:
-                plate2 = None
-            sim_car = car1 @ car2
-            if plate1 is not None and plate2 is not None:
-                sim_plate = plate1 @ plate2
-                sim = 0.2 * sim_car + 0.8 * sim_plate
-            else:
-                sim = sim_car
-            if sim > sim_gate:
-                candidates_filter.append(noise)
-        return candidates_filter
-
     recall_attempts, cr_idxs, node_to_noises = args
     car1, plate1 = None, None
     accept_recalls = []
+    
     for tmp in recall_attempts:
         # 判断加入概率是否更高
-        # ?
         if len(tmp) == 3:
             (u, ut), (v, vt), inter_camera_nodes = tmp
             p_base = None
@@ -276,7 +314,7 @@ def recall_unit(args):
                     continue
                 if car1 is None:
                     car1, plate1 = calculate_ave_f(cr_idxs)
-                candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=0.7)
+                candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=DENOISE_SIM_GATE)
                 
                 # fomula 9
                 if candidates_filter:
@@ -290,8 +328,7 @@ def recall_unit(args):
         else:
             node, tm = tmp
             candidates = [
-                noise
-                    for noise in node_to_noises[node]
+                noise for noise in node_to_noises[node]
                         if tm - MERGE_ATTEMPT_ADJ_RANGE < noise[0] < tm + MERGE_ATTEMPT_ADJ_RANGE
             ]
             if not candidates:
@@ -339,14 +376,8 @@ def update_f_emb(labels, do_update=True):
         start_time = time.time()
         
         # node_to_noises
-        node_to_noises = defaultdict(list) # [(avg_tms, idx), ..., ]
-        for idxs in (noise[0] for noises in cid_to_noises.values() 
-                                for noise in noises):
-            tms = [records[i]["time"] for i in idxs]
-            camera_id = records[idxs[0]]["camera_id"]
-            node = cameras_dict[camera_id]["node_id"]
-            node_to_noises[node].append((np.mean(tms), idxs))
-        
+        node_to_noises = get_node_to_noises(cid_to_noises)
+
         args = [
             (recall_attempts, cid_to_rids[cid], node_to_noises)
                 for cid, recall_attempts in cid_to_recall_attempts.items()
@@ -355,11 +386,13 @@ def update_f_emb(labels, do_update=True):
         with Pool(processes=workers) as pool:
             results = pool.map(recall_unit, args, chunksize=chunksize) # list(accept_recalls)
         
+        # ? why rids
         rids_to_cid_reward = defaultdict(list)
         for cid, accept_recalls in zip(cid_to_recall_attempts.keys(), results):
             if accept_recalls:
                 for idxs, reward in accept_recalls:
                     rids_to_cid_reward[tuple(idxs)].append((cid, reward))
+        
         for idxs, cid_reward in rids_to_cid_reward.items():
             max_cid = max(cid_reward, key=lambda x: x[1])[0]
             cid_to_accept_recalls[max_cid] += idxs
@@ -412,70 +445,34 @@ def update_f_emb(labels, do_update=True):
     return cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts
 
 
-def ave_f_unit(rids):
-    """calculate the represent features for clusters
+def filter_noise_by_similarity(cid, noise_cids, cid_to_rids):
+    """filter by `multi-model similarity`, for each record in each cluster
 
     Args:
-        rids (_type_): _description_
+        cid (int): _description_
+        noise_cids (list): _description_
+        cid_to_rids (dict): _description_
 
     Returns:
-        _type_: _description_
+        list: noise list
     """
-    if len(rids) == 1:
-        return f_car[i], f_plate[i]
-    else:
-        fs_car = [f_car[i] for i in rids]
-        fs_plate = [f_plate[i] for i in rids]
-        ave_car = np.mean(np.asarray(fs_car), axis=0)
-        fs_plate = [x for x in fs_plate if x is not None]
-        if fs_plate:
-            ave_plate = np.mean(np.asarray(fs_plate), axis=0)
-        else:
-            ave_plate = None
-        
-        return ave_car, ave_plate
+    idxs1 = cid_to_rids[cid]
+    car1, plate1 = calculate_ave_f(idxs1)
 
-
-def merge_cluster_unit(args):
-    # 1. prepare variables
-    (c, ncs), cid_to_rids = args
-    idxs1 = cid_to_rids[c]
-    car1 = [f_car[i] for i in idxs1]
-    plate1 = [f_plate[i] for i in idxs1]
-    car1 = np.mean(np.asarray(car1), axis=0)
-    car1 /= np.linalg.norm(car1) + 1e-12
-    plate1 = [x for x in plate1 if x is not None]
-    if plate1:
-        plate1 = np.mean(np.asarray(plate1), axis=0)
-        plate1 /= np.linalg.norm(plate1) + 1e-12
-    else:
-        plate1 = None
-
-    # 2. filter by `multi-model similarity`, for each record in each cluster
     nidxs_filter = []
-    for nc in ncs:
+    for nc in noise_cids:
         idxs2 = cid_to_rids[nc]
         for i in idxs2:
-            car2 = f_car[i]
-            plate2 = f_plate[i]
-            car2 /= np.linalg.norm(car2) + 1e-12
-            if plate2 is not None:
-                plate2 /= np.linalg.norm(plate2) + 1e-12
-            
-            sim_car = car1 @ car2
-            if plate1 is not None and plate2 is not None:
-                sim_plate = plate1 @ plate2
-                sim = 0.2 * sim_car + 0.8 * sim_plate
-            else:
-                sim = sim_car
+            car2, plate2 = get_feat_by_rid(i)
+            sim = cal_multi_similarity(car1, plate1, car2, plate2)
             if sim > MERCLUSTER_SIM_GATE:
                 nidxs_filter.append(i)
-    if not nidxs_filter:
-        return []
 
-    # 3. filter by time intervals
+    return nidxs_filter    
+
+def filter_noise_by_time(cid, nidxs_filter, cid_to_rids):
     points_nc_filter = []
-    points      = trans_rids_to_points(cid_to_rids[c], records, cameras_dict) # (node_id, time, rid)
+    points      = trans_rids_to_points(cid_to_rids[cid], records, cameras_dict) # (node_id, time, rid)
     points_nc   = trans_rids_to_points(nidxs_filter, records, cameras_dict)
     tm_ranges   = tms_adj_range(sorted([x[1] for x in points]), 
                                 adj_range=MERGE_CLUSTER_ADJ_RANGE)
@@ -488,16 +485,28 @@ def merge_cluster_unit(args):
                 break
         if flag:
             points_nc_filter.append(p)
+    
+    return points, points_nc_filter
+
+def merge_cluster_unit(args):
+    # 1. prepare variables
+    (c, ncs), cid_to_rids = args
+    rids = cid_to_rids[c]
+
+    # 2. filter by `multi-model similarity`, for each record in each cluster
+    nidxs_filter = filter_noise_by_similarity(c, ncs, cid_to_rids)
+    if not nidxs_filter:
+        return []
+
+    # 3. filter by time intervals
+    points, points_nc_filter = filter_noise_by_time(c, nidxs_filter, cid_to_rids)
     if not points_nc_filter:
         return []
 
     # 4. merge and split points into `segs`
     points_nc = points_nc_filter
     points_all = points + points_nc
-    points_all = merge_tm_adj_points(points_all, adj_range=ADJ_RANGE)
-    points_all = merge_tm_adj_points(points_all, adj_range=ADJ_RANGE)
-    points_all.sort(key=lambda x: x[1]) # (node id, time, rid list)
-    cuts = cut_distant_points(points_all, tm_gap_gate=TM_GAP_GATE)
+    points_all, cuts = merge_and_split_points(points_all)
 
     # 5. process cuts
     noises = process_segs(cuts)
@@ -614,7 +623,7 @@ if __name__ == "__main__":
     N_iter = 10
     s = 0.8
     topK = 128
-    ngpu = 1
+    ngpu = 2
     metrics = []
     load_data = False
 

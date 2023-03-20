@@ -248,28 +248,32 @@ def parralle_process(func, arges, chunksize, workers=32):
     
     return results
 
-def f_noname(one_cut):
-    len_cut = len(one_cut)
+def greedy_search_trajs(seg, ratio=.5):
+    _len = len(seg)
     p_dict = {}
     sub_ps_raw = []
     sub_ps = []
     sub_idxs = []
-    for sub_idx in subsets(list(range(len_cut)), k=ceil(len_cut * 3 / 5)):
+    
+    # enumerate the k largest subsets
+    for sub_idx in subsets(list(range(_len)), k=ceil(_len * ratio)):
         ps = []
         for i, j in zip(sub_idx, sub_idx[1:]):
             p = p_dict.get((i, j), None)
             if p is None:
-                u, ut = one_cut[i][:2]
-                v, vt = one_cut[j][:2]
+                u, ut = seg[i][:2]
+                v, vt = seg[j][:2]
                 p = MAP_routing(u, v, ut, vt)
                 p_dict[(i, j)] = p
             ps.append(p)
-        p = np.exp(np.mean(np.log(ps)))
-        sub_ps_raw.append(p)
-        sub_ps.append(np.exp(np.sum(np.log(ps)) / (len(ps) + 2)))
-        sub_idxs.append(sub_idx)
         
-        max_sub_p = max(sub_ps)
+        p = np.exp(np.mean(np.log(ps)))
+        _p = np.exp(np.sum(np.log(ps)) / (len(ps) + 2))
+        sub_ps_raw.append(p)
+        sub_ps.append(_p)
+        sub_idxs.append(sub_idx)
+    
+    return _len, sub_ps_raw, sub_ps, sub_idxs
 
 def process_segs(cuts):
     noises = [] # rids
@@ -289,31 +293,7 @@ def process_segs(cuts):
     
     # process long cuts
     for one_cut in long_cuts:
-        len_cut = len(one_cut)
-        p_dict = {}
-        sub_ps_raw = []
-        sub_ps = []
-        sub_idxs = []
-        
-        # greedy approach that enumerates the k largest subsets
-        # Notice: `idx` here is the index instead of real value
-        for sub_idx in subsets(list(range(len_cut)), k=ceil(len_cut * 3 / 5)):
-            ps = []
-            for i, j in zip(sub_idx, sub_idx[1:]):
-                p = p_dict.get((i, j), None)
-                if p is None:
-                    u, ut = one_cut[i][:2]
-                    v, vt = one_cut[j][:2]
-                    p = MAP_routing(u, v, ut, vt)
-                    p_dict[(i, j)] = p
-                ps.append(p)
-            
-            p = np.exp(np.mean(np.log(ps)))
-            _p = np.exp(np.sum(np.log(ps)) / (len(ps) + 2)) # formula 7
-            sub_ps_raw.append(p)
-            sub_ps.append(_p) 
-            sub_idxs.append(sub_idx)
-
+        len_cut, sub_ps_raw, sub_ps, sub_idxs = greedy_search_trajs(one_cut, .6)
         # formula 6: sub_idxs 子集
         max_sub_p = max(sub_ps)
         if max_sub_p < 0.3:
@@ -354,3 +334,10 @@ def filter_noises(noises, recalled_noises, cls='strong'):
     
     return set(sum(res, []))
 
+def merge_and_split_points(points):
+    points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
+    points = merge_tm_adj_points(points, adj_range=ADJ_RANGE)
+    points.sort(key=lambda x: x[1]) # (node id, time, rid list)
+    cuts = cut_distant_points(points, tm_gap_gate=TM_GAP_GATE)
+    
+    return points, cuts
