@@ -1,2 +1,2 @@
 cd ./main
-NUMEXPR_MAX_THREADS=16 && python run.py
+NUMEXPR_MAX_THREADS=32 && python run.py

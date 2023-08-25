@@ -4,6 +4,13 @@ from tqdm import tqdm
 import numpy as np
 from multiprocessing import Pool, cpu_count
 
+
+def parallel_process(func, args, chunksize, workers=64):
+    with Pool(processes=workers) as pool:
+        results = pool.map(func, args, chunksize=chunksize)
+    
+    return results
+
 #! FIXME 为何调用反而耗时更长
 def parallel(func, args, asynch=True, n_jobs=-1, multiple=False, chunksize=None):
     if n_jobs > cpu_count() or n_jobs == -1:

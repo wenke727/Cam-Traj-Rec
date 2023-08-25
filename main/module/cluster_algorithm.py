@@ -2,13 +2,10 @@
 the clustering algorithm
 """
 from tqdm import tqdm
-import coloredlogs
-import logging
 import numpy as np
 import faiss
 from collections import defaultdict
-
-coloredlogs.install(fmt="%(asctime)s.%(msecs)03d %(levelname)s %(message)s")
+from loguru import logger
 
 
 def normalize(feature):
@@ -160,15 +157,7 @@ class SigCluster:
         self.searchers = {i: FlatSearcher(ngpu, i) for i in set(feature_dims)}
         self.f_dims = feature_dims
 
-    def fit(
-        self,
-        data,
-        initial_labels=None,
-        weights=[0.1, 0.9],
-        similarity_threshold=0.88,
-        topK=128,
-        normalized=True,
-    ):
+    def fit(self, data, initial_labels=None, weights=[0.1, 0.9], similarity_threshold=0.88, topK=128, normalized=True,):
         if isinstance(weights, float) or isinstance(weights, int):
             weights = [weights] * len(self.f_dims)
         else:
@@ -182,12 +171,12 @@ class SigCluster:
         N_f = len(data[0])
 
         if normalized:
-            logging.info("Normalize")
+            logger.info("Normalize")
             data = [
                 [None if j is None else normalize(j) for j in i] for i in tqdm(data)
             ]
 
-        logging.info("Search topk")
+        logger.info("Search topk")
 
         data_ = list(zip(*data))
         fs = []
@@ -218,7 +207,7 @@ class SigCluster:
                 [None if j is None else normalize(j) for j in i] for i in tqdm(data)
             ]
 
-        logging.info("Clustering")
+        logger.info("Clustering")
         cf_means = {}
         cfs = {}
         if initial_labels is None:
@@ -268,5 +257,5 @@ class SigCluster:
                 cids[i] = cid
                 cf_means[cid] = record
                 cfs[cid] = [[] if j is None else [] for j in record]
-        logging.info("done")
+        logger.info("done")
         return cids

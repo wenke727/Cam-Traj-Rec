@@ -1,4 +1,7 @@
+*.log
 .vscode
+data/
+data
 
 __pycache__
 dataset/records_100w_pca_64.pkl

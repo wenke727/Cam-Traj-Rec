@@ -4,62 +4,32 @@ do the clustering and the feedback
 """
 import os
 os.environ["NUMEXPR_MAX_THREADS"] = '32'
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
 
 import time
 import json
 import pickle
 import random
 import numpy as np
-from tqdm import tqdm
 from math import ceil, sqrt
 from eval import evaluate
-from copy import deepcopy
-from multiprocessing import Pool
 from collections import defaultdict
+from loguru import logger
 
-from cluster_algorithm import SigCluster, FlatSearcher
-from routing import MAP_routing, MAP_routing_return_route, my_k_shortest_paths
-
-from misc import subsets, tms_adj_range, trans_rids_to_points, merge_tm_adj_points, cut_distant_points
-from misc import get_merge_point_idxs, process_segs, filter_noises, merge_and_split_points, greedy_search_trajs
 from cfg import *
-from utils import parallel
+from utils.parallel_helper import parallel_process
+from module.cluster_algorithm import SigCluster, FlatSearcher
+from module.routing import MAP_routing, pre_compute_shortest_path
+from dataProcess import load_data, get_cid_2_rids, get_feat_by_rid, merge_and_split_points, trans_rids_to_points, tms_adj_range, load_ori_metric, get_merge_point_idxs, get_node_to_noises
+
+from misc import process_segs, filter_noises, identify_noisy_and_recall_points
 
 random.seed(233)
 import time
-DO_RECALL_ATTEMPT = True
-DO_MERGE_ATTEMPT = False
-DO_NOISE_SINGLE_CLUSTER = False
-
-MERCLUSTER_SIM_GATE = 0.8
-DENOISE_SIM_GATE = 0.7
-MISS_SHOT_P = 0.6
-ADJ_RANGE = 180
-MERGE_ATTEMPT_ADJ_RANGE = ADJ_RANGE / 2
-TM_GAP_GATE = 720
-MERGE_CLUSTER_ADJ_RANGE = 300
-
-workers = 64
 
 
-cameras = pickle.load(open("../dataset/camera_info.pkl", "rb"))
-cameras_dict = {x["id"]: x for x in cameras}
-
-G = pickle.load(open("../dataset/road_graph.pkl", "rb"))
-
-records = pickle.load(open("../dataset/records_100w_pca_64.pkl", "rb"))
-
-f_car = [x["car_feature"] for x in records]
-f_plate = [x["plate_feature"] for x in records]
-f_emb = deepcopy(f_car)
-
-vid_to_rids = defaultdict(list)
-for i, r in enumerate(records):
-    t = r["vehicle_id"]
-    if t is not None:
-        vid_to_rids[t].append(i)
-
-""" aux funs """
+""" aux data process funs """
 def calculate_ave_f(rids): # , f_car=f_car, f_plate=f_plate
     """calculate the average feather of `rids`, considering the normalization.
 
@@ -108,15 +78,9 @@ def ave_f_unit(rids):
         
         return ave_car, ave_plate
 
-def get_feat_by_rid(rid):
-    car2 = f_car[rid]
-    plate2 = f_plate[rid]
-    car2 /= np.linalg.norm(car2) + 1e-12
-    if plate2 is not None:
-        plate2 /= np.linalg.norm(plate2) + 1e-12
+cameras, cameras_dict, G, records, f_car, f_plate, f_emb = load_data()
 
-    return car2, plate2
-
+""" aux cluster funcs """
 def cal_multi_similarity(car1, plate1, car2, plate2):
     sim_car = car1 @ car2
     if plate1 is not None and plate2 is not None:
@@ -128,6 +92,7 @@ def cal_multi_similarity(car1, plate1, car2, plate2):
     return sim
 
 def sim_filter(car, plate, candidates, sim_gate=0.7):
+    # TODO 函数示例
     candidates_filter = []
     for noise in candidates:
         idxs2 = noise[1]
@@ -139,36 +104,71 @@ def sim_filter(car, plate, candidates, sim_gate=0.7):
             
     return candidates_filter
 
-def get_node_to_noises(cid_to_noises):
-    node_to_noises = defaultdict(list) # [(avg_tms, idx), ..., ]
-    noises = (noise[0] for noises in cid_to_noises.values() 
-                            for noise in noises)
-    for idxs in noises:
-        tms = [records[i]["time"] for i in idxs]
-        camera_id = records[idxs[0]]["camera_id"]
-        node = cameras_dict[camera_id]["node_id"]
-        node_to_noises[node].append((np.mean(tms), idxs))
+def filter_noise_by_similarity(cid, noise_cids, cid_to_rids):
+    """filter by `multi-model similarity`, for each record in each cluster
+
+    Args:
+        cid (int): The cluster index.
+        noise_cids (list): The list of noise cluster index.
+        cid_to_rids (dict): The dict that map `cluser index` to `records index` list.
+
+    Returns:
+        list: noise list
+    """
+    idxs1 = cid_to_rids[cid]
+    car1, plate1 = calculate_ave_f(idxs1)
+
+    noise_rids = []
+    for nc in noise_cids:
+        idxs2 = cid_to_rids[nc]
+        for i in idxs2:
+            car2, plate2 = get_feat_by_rid(i, f_car, f_plate)
+            sim = cal_multi_similarity(car1, plate1, car2, plate2)
+            if sim > MERCLUSTER_SIM_GATE: # 0.8
+                noise_rids.append(i)
+
+    return noise_rids    
+
+def filter_noise_by_time(rids, noise_rids, adj_range = MERGE_CLUSTER_ADJ_RANGE):
+    """
+    This function filters out noise data points from a list of data points based on their time intervals with a list of trajectory points.
+
+    Parameters:
+    rids (list): A list of record IDs representing trajectory points.
+    noise_rids (list): A list of record IDs representing noise data points.
+    adj_range (float, optional): The range to extend each time point when forming time intervals. Defaults to MERGE_CLUSTER_ADJ_RANGE (300).
+
+    The function first transforms the record IDs into points, where each point is a tuple containing node ID, time, and record ID. Then, it forms time intervals by extending each time point in 'rids' by 'adj_range' and merging overlapping intervals. Finally, it filters out noise data points in 'noise_rids' that do not fall within any of the time intervals.
+
+    Returns:
+    points, points_nc_filter (tuple): A tuple containing two lists of points. The first list 'points' contains points transformed from 'rids', and the second list 'points_nc_filter' contains noise data points in 'noise_rids' that fall within the time intervals. Point format: `(node_id, time, rid)`
+    """
+
+    points_nc_filter = []
+    points_nc   = trans_rids_to_points(noise_rids, records, cameras_dict)
+    points      = trans_rids_to_points(rids, records, cameras_dict) 
+    tm_ranges   = tms_adj_range(sorted([x[1] for x in points]), adj_range = adj_range)
     
-    return node_to_noises
+    for p in points_nc:
+        t = p[1]
+        flag = False
+        for min_t, max_t in tm_ranges:
+            if min_t < t < max_t:
+                flag = True
+                break
+        if flag:
+            points_nc_filter.append(p)
+    
+    return points, points_nc_filter
 
 
 """ ori funs """
 def avg_cluster_feat(cs, cid_to_rids, chunksize=500):
+    t = time.time()
     args = [cid_to_rids[c] for c in cs]
-    with Pool(processes=workers) as pool:
-        results = pool.map(
-            ave_f_unit, args, chunksize=min(ceil(len(args) / workers), chunksize))
-    
+    results = parallel_process(ave_f_unit, args, min(ceil(len(args) / workers), chunksize), workers)
     car_feat = np.asarray([x[0] for x in results])
-
-    # TODO 模块化
-    # t = time.time()
-    # res = parallel(ave_f_unit, args, False, n_jobs=workers, chunksize=min(ceil(len(args) / workers), chunksize))
-    # print(f'avg_cluster_feat_1: {time.time() - t: .4f}')
-    # _car_feat = np.asarray([x[0] for x in res])
-    # assert np.allclose(car_feat, _car_feat), "check"
     
-    # `plate_feat` maybe None
     tmp = [(x[1], c) for x, c in zip(results, cs) if x[1] is not None]
     plate_feat = np.asarray([x[0] for x in tmp])
     plate_feat_c = [x[1] for x in tmp]
@@ -177,7 +177,7 @@ def avg_cluster_feat(cs, cid_to_rids, chunksize=500):
 
 
 def detect_many_noise(cuts):
-    """_summary_
+    """detect noise by spatial-temporal constrain.
 
     Args:
         cuts (tuple): (node, time, rid lst)
@@ -214,11 +214,10 @@ def detect_many_noise(cuts):
                     
         elif len(one_cut) == 2:
             (u, ut, _), (v, vt, _) = one_cut
-            p = MAP_routing(u, v, ut, vt)
+            inter_nodes, p = MAP_routing(u, v, ut, vt, result_type='route')
             if p < 0.05:
                 noises += [(x[-1], TWO_NOISE) for x in one_cut]
             elif DO_RECALL_ATTEMPT and p > 0.4:
-                inter_nodes, _ = MAP_routing_return_route(u, v, ut, vt)
                 inter_camera_nodes = [
                     node for node in inter_nodes if "camera" in G.nodes[node]
                 ]
@@ -229,44 +228,10 @@ def detect_many_noise(cuts):
 
     # case: len > 3 
     for one_cut in long_cuts:
-        _len, sub_ps_raw, sub_ps, sub_idxs = greedy_search_trajs(one_cut, .5)
-        
-        max_sub_p = max(sub_ps)
-        if max_sub_p < 0.05:
-            noises += [(x[-1], LONG_NOISE) for x in one_cut]
-        elif max_sub_p > 0.45:
-            black_list = set()
-            white_list = set()
-            
-            # iter nodes
-            for i in range(_len):
-                filterd_traj_ps = [p for p, idx in zip(sub_ps_raw, sub_idxs) if i in idx]
-                max_prob = max(filterd_traj_ps)
-                if max_prob < 0.01:
-                    black_list.add(i)
-                    noises.append((one_cut[i][-1], BLACK_LIST_NOISE))
-                else:
-                    ps = list(filter(lambda p: p >= 0.01, filterd_traj_ps))
-                    if (len(ps) >= min(_len / 3, 2) and np.mean(ps) > 0.1 and max(ps) > 0.3):
-                        white_list.add(i)
-
-            # formula 6: sub_idxs 子集
-            opt_cands = (x for x in zip(sub_ps, sub_idxs) if x[0] > 0.8 * max_sub_p)
-            opt_sub_p, opt_sub_idx = max(opt_cands, key = lambda x: (len(x[1]), x[0]))
-
-            for i in set(range(_len)) - set(opt_sub_idx) - black_list - white_list:
-                noises.append((one_cut[i][-1], OUT_OF_SUBSET_NOISE))
-
-            if DO_RECALL_ATTEMPT and opt_sub_p > 0.3:
-                for i, j in zip(opt_sub_idx, opt_sub_idx[1:]):
-                    u, ut, _ = one_cut[i]
-                    v, vt, _ = one_cut[j]
-                    inter_nodes, _ = MAP_routing_return_route(u, v, ut, vt)
-                    inter_camera_nodes = [
-                        node for node in inter_nodes if "camera" in G.nodes[node]
-                    ]
-                    if inter_camera_nodes:
-                        recall_attempts.append(((u, ut), (v, vt), inter_camera_nodes))
+        _noises, _recall_candidates = identify_noisy_and_recall_points(
+            one_cut, subset_ratio=.5, noise_prob=0.05, min_prob=.45, min_len=2, min_avg_p=.1, min_max_p=.3, do_recall_attempt=True, net=G)
+        noises.extend(_noises)
+        recall_attempts.extend(_recall_candidates)
 
     if DO_MERGE_ATTEMPT:
         noise_idxss = {tuple(x[0]) for x in noises}
@@ -302,7 +267,6 @@ def recall_unit(args):
     accept_recalls = []
     
     for tmp in recall_attempts:
-        # 判断加入概率是否更高
         if len(tmp) == 3:
             (u, ut), (v, vt), inter_camera_nodes = tmp
             p_base = None
@@ -314,7 +278,7 @@ def recall_unit(args):
                     continue
                 if car1 is None:
                     car1, plate1 = calculate_ave_f(cr_idxs)
-                candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=DENOISE_SIM_GATE)
+                candidates_filter = sim_filter(car1, plate1, candidates, sim_gate=DENOISE_SIM_GATE) # 0.7
                 
                 # fomula 9
                 if candidates_filter:
@@ -322,14 +286,14 @@ def recall_unit(args):
                         p_base = MAP_routing(u, v, ut, vt)
                     for tm, idxs in candidates_filter:
                         p_new = sqrt(MAP_routing(u, node, ut, tm) * MAP_routing(node, v, tm, vt))
-                        t = p_new * (1 - MISS_SHOT_P) - p_base * MISS_SHOT_P
+                        t = p_new * (1 - MISS_SHOT_P) - p_base * MISS_SHOT_P # MISS_SHOT_P: 0.6
                         if t > 0:
                             accept_recalls.append((idxs, t))
         else:
             node, tm = tmp
             candidates = [
                 noise for noise in node_to_noises[node]
-                        if tm - MERGE_ATTEMPT_ADJ_RANGE < noise[0] < tm + MERGE_ATTEMPT_ADJ_RANGE
+                        if tm - MERGE_ATTEMPT_ADJ_RANGE < noise[0] < tm + MERGE_ATTEMPT_ADJ_RANGE # 90
             ]
             if not candidates:
                 continue
@@ -346,46 +310,37 @@ def update_f_emb(labels, do_update=True):
     global f_emb
 
     # 0. preprocess: cid_to_rids
-    cid_to_rids = defaultdict(list)
-    for i, c in enumerate(labels):
-        if c != -1:
-            cid_to_rids[c].append(i)
+    cid_to_rids = get_cid_2_rids(labels)
 
     # 1. detecting noise ahd recall attempt
     cid_to_noises = {}
     cid_to_recall_attempts = {}
 
-    print("detecting noise...")
+    logger.info("detecting noise...")
     start_time = time.time()
-    chunksize = min(ceil(len(cid_to_rids) / workers), 200)
-    with Pool(processes=workers) as pool:
-        results = pool.map(
-            noise_detect_unit, cid_to_rids.values(), chunksize=chunksize) # list((noises, recall_attempts))
-    
+    results = parallel_process(noise_detect_unit, cid_to_rids.values(), 
+                               chunksize=min(ceil(len(cid_to_rids) / workers), 200),
+                               workers=workers)
     for cid, (noises, recall_attempts) in zip(cid_to_rids.keys(), results):
         if noises:
             cid_to_noises[cid] = noises
         if recall_attempts:
             cid_to_recall_attempts[cid] = recall_attempts
-    print("detect noise use time:", time.time() - start_time)
+    logger.info("detect noise use time:", time.time() - start_time)
 
     # 2. recall
     cid_to_accept_recalls = defaultdict(list)
     if DO_RECALL_ATTEMPT:
-        print("recalling...")
+        logger.debug("recalling...")
         start_time = time.time()
         
         # node_to_noises
-        node_to_noises = get_node_to_noises(cid_to_noises)
-
-        args = [
-            (recall_attempts, cid_to_rids[cid], node_to_noises)
-                for cid, recall_attempts in cid_to_recall_attempts.items()
-        ]
-        chunksize = min(ceil(len(args) / workers), 200)
-        with Pool(processes=workers) as pool:
-            results = pool.map(recall_unit, args, chunksize=chunksize) # list(accept_recalls)
-        
+        node_to_noises = get_node_to_noises(cid_to_noises, records, cameras_dict)
+        args = [(recall_attempts, cid_to_rids[cid], node_to_noises)
+                    for cid, recall_attempts in cid_to_recall_attempts.items()]
+        results = parallel_process(recall_unit, args, 
+                                   chunksize=min(ceil(len(args) / workers), 200),
+                                   workers=workers)
         # ? why rids
         rids_to_cid_reward = defaultdict(list)
         for cid, accept_recalls in zip(cid_to_recall_attempts.keys(), results):
@@ -397,7 +352,7 @@ def update_f_emb(labels, do_update=True):
             max_cid = max(cid_reward, key=lambda x: x[1])[0]
             cid_to_accept_recalls[max_cid] += idxs
         
-        print("recall use time:", time.time() - start_time)
+        logger.info(f"recall use time: {time.time() - start_time:.2f}")
 
     if not do_update:
         return cid_to_noises, cid_to_accept_recalls
@@ -445,74 +400,50 @@ def update_f_emb(labels, do_update=True):
     return cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts
 
 
-def filter_noise_by_similarity(cid, noise_cids, cid_to_rids):
-    """filter by `multi-model similarity`, for each record in each cluster
+def merge_cluster_unit(args):
+    """
+    This function merges a cluster with its nearest clusters based on their similarity and temporal adjacency.
 
-    Args:
-        cid (int): _description_
-        noise_cids (list): _description_
-        cid_to_rids (dict): _description_
+    Parameters:
+    args (tuple): A tuple containing two elements: 
+                  1) a tuple (c, ncs), where 'c' is the label of the cluster to be merged and 'ncs' is a set of labels of its nearest clusters;
+                  2) a dictionary 'cid_to_rids', where the key is a cluster label and the value is a list of indices of data points belonging to the cluster.
+
+    The function performs the following steps:
+
+    1. Prepares variables for the cluster 'c' and its nearest clusters 'ncs'.
+    2. Filters out noise data points from 'ncs' based on their multi-model similarity with 'c'.
+    3. Filters out noise data points from 'ncs' based on their time intervals with 'c'.
+    4. Merges 'c' and 'ncs' into a new cluster and splits it into segments based on their temporal adjacency.
+    5. Processes each segment and identifies noise data points.
+    6. Returns the indices of data points in 'ncs' that are not identified as noise and are accepted to be merged with 'c'.
 
     Returns:
-        list: noise list
+    accept_idxs (list): A list of indices of data points in 'ncs' that are accepted to be merged with 'c'.
     """
-    idxs1 = cid_to_rids[cid]
-    car1, plate1 = calculate_ave_f(idxs1)
-
-    nidxs_filter = []
-    for nc in noise_cids:
-        idxs2 = cid_to_rids[nc]
-        for i in idxs2:
-            car2, plate2 = get_feat_by_rid(i)
-            sim = cal_multi_similarity(car1, plate1, car2, plate2)
-            if sim > MERCLUSTER_SIM_GATE:
-                nidxs_filter.append(i)
-
-    return nidxs_filter    
-
-def filter_noise_by_time(cid, nidxs_filter, cid_to_rids):
-    points_nc_filter = []
-    points      = trans_rids_to_points(cid_to_rids[cid], records, cameras_dict) # (node_id, time, rid)
-    points_nc   = trans_rids_to_points(nidxs_filter, records, cameras_dict)
-    tm_ranges   = tms_adj_range(sorted([x[1] for x in points]), 
-                                adj_range=MERGE_CLUSTER_ADJ_RANGE)
-    for p in points_nc:
-        t = p[1]
-        flag = False
-        for min_t, max_t in tm_ranges:
-            if min_t < t < max_t:
-                flag = True
-                break
-        if flag:
-            points_nc_filter.append(p)
-    
-    return points, points_nc_filter
-
-def merge_cluster_unit(args):
     # 1. prepare variables
     (c, ncs), cid_to_rids = args
     rids = cid_to_rids[c]
 
-    # 2. filter by `multi-model similarity`, for each record in each cluster
-    nidxs_filter = filter_noise_by_similarity(c, ncs, cid_to_rids)
-    if not nidxs_filter:
+    # 2. filter by `multi-model similarity`, similarity > .8
+    cands = filter_noise_by_similarity(c, ncs, cid_to_rids)
+    if not cands:
         return []
 
-    # 3. filter by time intervals
-    points, points_nc_filter = filter_noise_by_time(c, nidxs_filter, cid_to_rids)
-    if not points_nc_filter:
+    # 3. filter by time intervals, [-300, +300]
+    points, cands = filter_noise_by_time(rids, cands)
+    if not cands:
         return []
 
     # 4. merge and split points into `segs`
-    points_nc = points_nc_filter
-    points_all = points + points_nc
-    points_all, cuts = merge_and_split_points(points_all)
+    points_all = points + cands
+    points_all, segs = merge_and_split_points(points_all)
 
     # 5. process cuts
-    noises = process_segs(cuts)
+    noises = process_segs(segs)
 
     # 6. get accepted idxs
-    cand_noise_idxs = {x[-1] for x in points_nc}
+    cand_noise_idxs = {x[-1] for x in cands}
     noise_idxs  = {idx for idxs in noises for idx in idxs}
     merge_point_idxs = get_merge_point_idxs(points, points_all)
     accept_idxs = cand_noise_idxs - noise_idxs - merge_point_idxs
@@ -520,16 +451,33 @@ def merge_cluster_unit(args):
     return list(accept_idxs)
 
 
-def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
+def merge_clusters(labels, step, ngpu=1, car_topk=15, plate_topk=30):
+    """
+    This function merges clusters based on their similarity and temporal adjacency.
+
+    Parameters:
+    - labels (list): A list of cluster labels for each data point.
+    - step (int): The current iteration step.
+    - ngpu (int): The number of GPUs to use for computation. Default is 1.
+    - car_topk (int): The number of top similar car clusters to consider for merging. Default is 15.
+    - plate_topk (int): The number of top similar plate clusters to consider for merging. Default is 30.
+
+    The function first groups data points into clusters based on the input labels. 
+    Then, it iteratively performs the following steps for three rounds:
+
+    1. Divides clusters into two groups: 'big' clusters and 'small' clusters, based on their sizes.
+    2. For each 'big' cluster, computes its average feature vector and finds its nearest neighbors among 'small' clusters.
+    3. Merges each 'big' cluster with its nearest 'small' clusters if they are temporally adjacent and their similarity exceeds a threshold.
+
+    The function updates the labels and the global feature vectors during the process.
+
+    Returns:
+    - labels (list): A list of updated cluster labels for each data point.
+    """
     global f_emb
     print("cluster merging...")
     start_time = time.time()
-
-    cid_to_rids = defaultdict(list)
-    # i: rid; c: cid
-    for i, c in enumerate(labels):
-        if c != -1:
-            cid_to_rids[c].append(i)
+    cid_to_rids = get_cid_2_rids(labels)
 
     for nn in range(3):
         if nn == 0:
@@ -565,7 +513,7 @@ def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
         car_gallery, plate_gallery, plate_gallery_c = \
             avg_cluster_feat(cs_small, cid_to_rids, 500)
 
-        # search
+        # rough search
         car_searcher = FlatSearcher(feat_len=64, ngpu=ngpu)
         plate_searcher = FlatSearcher(feat_len=64, ngpu=ngpu)
         car_topk_idxs = car_searcher.search_by_topk(
@@ -573,25 +521,25 @@ def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
         plate_topk_idxs = plate_searcher.search_by_topk(
             query=plate_query, gallery=plate_gallery, topk=plate_topk)[1].tolist()
         
-        # `cluster id` to noise `cluster ids`
-        c_to_nc = defaultdict(set)
+        # `cluster id` to `noise cluster ids`
+        cid_to_ncids = defaultdict(set)
         for c, rids in zip(cs_big, car_topk_idxs):
             for i in rids:
-                c_to_nc[c].add(cs_small[i])
+                cid_to_ncids[c].add(cs_small[i])
         for c, rids in zip(plate_query_c, plate_topk_idxs):
             for i in rids:
-                c_to_nc[c].add(plate_gallery_c[i])
-
+                cid_to_ncids[c].add(plate_gallery_c[i])
+        
         # merge_cluster
-        args = [((c, ncs), cid_to_rids) for c, ncs in c_to_nc.items()]
-        with Pool(processes=workers) as pool:
-            results = pool.map(
-                merge_cluster_unit, args, chunksize=min(ceil(len(args) / workers), 200))
+        args = [((c, ncs), cid_to_rids) for c, ncs in cid_to_ncids.items()]
+        results = parallel_process(merge_cluster_unit, args,
+                                   chunksize=min(ceil(len(args) / workers), 200),
+                                   workers=workers)
 
         # cid_2_accept_rids: `cluster id` -> `accept idxs`  
         accept_rid_2_cids = defaultdict(list)
         cid_2_accept_rids = defaultdict(list)
-        for c, accept_idxs in zip(c_to_nc.keys(), results):
+        for c, accept_idxs in zip(cid_to_ncids.keys(), results):
             for rid in accept_idxs:
                 accept_rid_2_cids[rid].append(c)
         for rid, cs in accept_rid_2_cids.items():
@@ -600,6 +548,9 @@ def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
             else:
                 cid_2_accept_rids[random.sample(cs, 1)[0]].append(rid)
 
+        logger.info(f"\t{step}/{nn}, cluster mapping {len(cid_to_ncids)} -> {sum([len(i) for i in cid_to_ncids.values()])}, "
+                    f"accept_rid_2_cids: {len(accept_rid_2_cids)}, cid_2_accept_rids: {len(cid_2_accept_rids)}")
+        
         # update `label` and `featrues`
         for c, rids in cid_2_accept_rids.items():
             for rid in rids:
@@ -615,7 +566,7 @@ def merge_clusters(labels, ngpu=1, car_topk=15, plate_topk=30):
             for rid in rids:
                 f_emb[rid] += delta
 
-    print("merging consume time:", time.time() - start_time)
+    logger.info(f"merging consume time: {time.time() - start_time:.2f}")
     return labels
 
 
@@ -627,22 +578,8 @@ if __name__ == "__main__":
     metrics = []
     load_data = False
 
-    cache_path = "data/shortest_path_results_test.pkl"
-    if not os.path.exists(cache_path):
-        print("pre-computing...")
-        camera_nodes = [x["node_id"] for x in cameras]
-        camera_nodes = set(camera_nodes)
-        shortest_path_results = {}
-        for u in tqdm(camera_nodes):
-            for v in camera_nodes:
-                if u != v:
-                    try:
-                        paths = [x for x in my_k_shortest_paths(u, v, 10)]
-                        shortest_path_results[(u, v)] = paths
-                    except:
-                        pass
-        print(len(shortest_path_results))
-        pickle.dump(shortest_path_results, open(cache_path, "wb"))
+    pre_compute_shortest_path("data/shortest_path_results_test.pkl")
+    ori_metric = load_ori_metric('./metric/metrics_ori.json')
 
     for i, operation in zip(range(N_iter), ["merge", "denoise"] * (N_iter // 2)):
         print(f"---------- iter {i}: {operation} -----------")
@@ -651,12 +588,9 @@ if __name__ == "__main__":
             print("clustering...")
             start_time = time.time()
             cluster = SigCluster(feature_dims=[64, 64, 64], ngpu=ngpu)
-            labels = cluster.fit(
-                [[a, b, c] for a, b, c in zip(f_car, f_plate, f_emb)],
-                weights=[0.1, 0.8, 0.1],
-                similarity_threshold=s,
-                topK=topK,
-            )
+            data = [[a, b, c] for a, b, c in zip(f_car, f_plate, f_emb)]
+            labels = cluster.fit(data, weights=[0.1, 0.8, 0.1], similarity_threshold=s, topK=topK)
+            
             print("clustering consume time:", time.time() - start_time)
             pickle.dump(labels, open(f"label/labels_iter_{i}.pkl", "wb"))
         else:
@@ -664,9 +598,13 @@ if __name__ == "__main__":
 
         precision, recall, fscore, expansion, vid_to_cid = evaluate(records, labels)
         metrics.append((precision, recall, fscore, expansion))
+        
+        all_close = np.allclose(ori_metric[i], np.array((precision, recall, fscore, expansion)))
+        print(f"all_close: {all_close}\n")
+        assert all_close, "Check accuracy"
 
         if operation == "merge":
-            merge_clusters(labels, ngpu=ngpu)
+            merge_clusters(labels, step=i, ngpu=ngpu)
         elif operation == "denoise":
             res = update_f_emb(labels, do_update=True)
             cid_to_noises, cid_to_accept_recalls, cid_to_recall_attempts = res
